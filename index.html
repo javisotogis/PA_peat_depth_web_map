@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Peat Depth Surveys — 30DayMapChallenge</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+
+    /* App: map + panel side-by-side, with a frame */
+    #app {
+      display: flex;
+      height: 100%;
+      box-sizing: border-box;
+      border: 8px solid #d0d7de;      /* frame around both map and panel */
+      border-radius: 12px;
+      overflow: hidden;                /* prevents map spillover */
+      background: #fff;
+    }
+
+    /* Map fills remaining space. min-width:0 prevents overflow into the panel */
+    #map {
+      flex: 1 1 auto;
+      min-width: 0;                    /* IMPORTANT in flex layouts */
+    }
+
+    /* Fixed-width right panel */
+    .panel {
+      flex: 0 0 360px;                 /* exact panel width */
+      padding: 14px 16px;
+      overflow: auto;
+      box-shadow: -4px 0 12px rgba(0,0,0,0.08);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+
+    .panel h1 { font-size: 22px; margin: 8px 0 6px; }
+    .panel p { color: #444; margin: 0 0 12px; }
+    .controls { display: grid; gap: 10px; margin: 10px 0 14px; }
+    .controls button { padding: 12px; border-radius: 12px; border: 1px solid #e5e5e5; background: #f6f6f6; cursor: pointer; }
+    select, label { font-size: 14px; }
+
+    .legend { font-size: 13px; }
+    .legend h4 { margin: 8px 0; }
+    .legend .row { display:flex; align-items:center; gap:8px; margin:4px 0; }
+    .legend .sw { display:inline-block; width:16px; height:12px; border:1px solid #444; }
+    .legend .actions { display:flex; gap:8px; margin:6px 0 10px; }
+    .legend .actions button { padding:6px 8px; border-radius:8px; border:1px solid #ddd; background:#f7f7f7; cursor:pointer; }
+
+    .popup table { border-collapse: collapse; font-size: 12px; }
+    .popup th, .popup td { border: 1px solid #ccc; padding: 3px 6px; }
+
+    /* Mobile: stack vertically */
+    @media (max-width: 900px) {
+      #app { flex-direction: column; }
+      .panel { flex: 0 0 auto; box-shadow: none; border-top: 1px solid #eee; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="map"></div>
+
+    <aside class="panel">
+      <h1>Peat Depth Surveys</h1>
+      <p>
+        Live peat depths from NatureScot GeoServer (WFS).<br>
+        Styled by peat depth (cm).<br>
+        Click a point for details.<br>
+        Select a grant to filter the points and get peat depth stats.
+      </p>
+
+      <div class="controls">
+        <label>
+          <input type="checkbox" id="useBbox" checked />
+          <strong>Only load features in the map view (faster)</strong>
+        </label>
+
+        <label>
+          Grant:
+          <select id="grantFilter">
+            <option value="">All</option>
+          </select>
+        </label>
+
+        <button id="reload">Reload</button>
+      </div>
+
+      <div class="legend" id="legend"></div>
+
+      <div id="stats" class="stats">
+        <h3>Stats</h3>
+        <ul style="list-style:none; padding-left:0; margin:6px 0;">
+          <li><strong>Survey points:</strong> <span id="s-count">0</span></li>
+          <li><strong>Avg depth (cm):</strong> <span id="s-avg">—</span></li>
+          <li><strong>&gt; 30 cm:</strong> <span id="s-p30">—</span></li>
+          <li><strong>&gt; 50 cm:</strong> <span id="s-p50">—</span></li>
+        </ul>
+      </div>
+
+      <details>
+        <summary>Data source</summary>
+        <code id="src"></code>
+      </details>
+
+      <p style="margin-top: 12px; font-size: 12px; color: #666; line-height: 1.4;">
+        <strong>Disclaimer:</strong> This website is not an official Peatland ACTION NatureScot release.
+        It was created by Javier Soto as part of the <em>30 Days Map Challenge</em> using open data from NatureScot
+        to promote the datasets.
+      </p>
+    </aside>
+  </div>
+
+<script>
+/* ========= CONFIG ========= */
+const WFS_BASE    = "https://ogc.nature.scot/geoserver/peatlandaction/wfs";
+const TYPE_NAME   = "peatlandaction:peatlandactionpoints";
+const WFS_VERSION = "2.0.0";
+const SRS         = "EPSG:4326";
+
+/* ========= URL builder (WFS 2.0) ========= */
+function wfsUrl({bbox=null}) {
+  const params = new URLSearchParams({
+    service: "WFS",
+    version: WFS_VERSION,
+    request: "GetFeature",
+    typeNames: TYPE_NAME,
+    outputFormat: "application/json",
+    srsName: SRS
+  });
+  if (bbox) params.set("bbox", bbox.join(",") + "," + SRS);
+  return `${WFS_BASE}?${params.toString()}`;
+}
+
+/* ========= Fetcher ========= */
+async function fetchAllFeatures({useBbox=false, map=null}) {
+  let bbox = null;
+  if (useBbox && map) {
+    const b = map.getBounds();
+    bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+  }
+  const url = wfsUrl({bbox});
+  console.log("WFS URL:", url);
+  const resp = await fetch(url, { mode: "cors" });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(()=> "");
+    throw new Error(`WFS failed ${resp.status}: ${resp.statusText}\n${txt.slice(0,500)}`);
+  }
+  return await resp.json(); // FeatureCollection
+}
+
+/* ========= Map ========= */
+const map = L.map("map", { preferCanvas: true }).setView([57.0, -4.5], 6);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution: "&copy; OpenStreetMap contributors"
+}).addTo(map);
+let layerGroup = L.layerGroup().addTo(map);
+
+/* ========= Styling & Accessors ========= */
+function depthColor(cm) {
+  if (cm == null || isNaN(cm)) return "#888";
+  if (cm < 30)  return "#fee5d9";
+  if (cm < 50)  return "#fcae91";
+  if (cm < 100) return "#fb6a4a";
+  if (cm < 150) return "#de2d26";
+  return "#a50f15";
+}
+function getDepth(feature) {
+  const p = feature.properties || {};
+  if (p.DEPTH_CM != null) {
+    const n = parseFloat(p.DEPTH_CM);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+function getDate(feature) {
+  const p = feature.properties || {};
+  return p.DATE_ ?? p.SURVEY_DATE ?? p.DATE ?? null;
+}
+function getSite(feature) {
+  const p = feature.properties || {};
+  return p.SITE ?? p.SITE_NAME ?? p.SiteName ?? "";
+}
+function onEachFeature(feature, layer) {
+  const p = feature.properties || {};
+  const depth = getDepth(feature);
+  const date  = getDate(feature);
+  const site  = getSite(feature);
+  const html = `
+    <div class="popup">
+      <h3>${site || "Peat depth survey"}</h3>
+      <table>
+        <tr><th>Depth (cm)</th><td>${depth ?? "—"}</td></tr>
+        <tr><th>Date</th><td>${date ?? "—"}</td></tr>
+        ${Object.entries(p).slice(0,20).map(([k,v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join("")}
+      </table>
+    </div>`;
+  layer.bindPopup(html);
+}
+
+/* ========= Depth bins + legend with checkboxes ========= */
+const DEPTH_BINS = [
+  { id: "lt30",    label: "< 30",     color: "#fee5d9", test: d => d < 30 },
+  { id: "30_49",   label: "30–49",    color: "#fcae91", test: d => d >= 30 && d < 50 },
+  { id: "50_99",   label: "50–99",    color: "#fb6a4a", test: d => d >= 50 && d < 100 },
+  { id: "100_149", label: "100–149",  color: "#de2d26", test: d => d >= 100 && d < 150 },
+  { id: "gte150",  label: "≥ 150",    color: "#a50f15", test: d => d >= 150 },
+];
+const enabledBins = new Set(DEPTH_BINS.map(b => b.id)); // all on by default
+
+function renderLegend() {
+  const div = document.getElementById("legend");
+
+  const rows = DEPTH_BINS.map(bin => `
+    <label class="row" title="Toggle ${bin.label}">
+      <input type="checkbox" class="depth-filter" value="${bin.id}" ${enabledBins.has(bin.id) ? "checked" : ""}/>
+      <span class="sw" style="background:${bin.color}"></span> ${bin.label}
+    </label>
+  `).join("");
+
+  div.innerHTML = `
+    <h4>Depth (cm)</h4>
+    <div class="actions">
+      <button id="depthAll">Select all</button>
+      <button id="depthNone">None</button>
+    </div>
+    ${rows}
+  `;
+
+  // Wire up change handlers
+  div.querySelectorAll('input.depth-filter').forEach(cb => {
+    cb.addEventListener('change', (e) => {
+      const id = e.target.value;
+      if (e.target.checked) enabledBins.add(id);
+      else enabledBins.delete(id);
+      renderLayer(); // re-filter + redraw without refetching
+    });
+  });
+
+  // All / None
+  div.querySelector('#depthAll').addEventListener('click', () => {
+    DEPTH_BINS.forEach(b => enabledBins.add(b.id));
+    renderLegend();  // rebuild checkboxes
+    renderLayer();
+  });
+  div.querySelector('#depthNone').addEventListener('click', () => {
+    enabledBins.clear();
+    renderLegend();
+    renderLayer();
+  });
+}
+renderLegend();
+
+/* ========= Stats ========= */
+function updateStats(features) {
+  const countAll = features.length;
+  const depths = features.map(getDepth).filter(d => Number.isFinite(d));
+  const n = depths.length;
+  const avg = n ? depths.reduce((a,b) => a + b, 0) / n : null;
+  const p30 = n ? (depths.filter(d => d >= 30).length / n) * 100 : null;
+  const p50 = n ? (depths.filter(d => d >= 50).length / n) * 100 : null;
+
+  document.getElementById("s-count").textContent = countAll;
+  document.getElementById("s-avg").textContent   = avg != null ? avg.toFixed(1) : "—";
+  document.getElementById("s-p30").textContent   = p30 != null ? p30.toFixed(1) + "%" : "—";
+  document.getElementById("s-p50").textContent   = p50 != null ? p50.toFixed(1) + "%" : "—";
+}
+
+/* ========= Rendering & Filtering ========= */
+let currentFeatures = [];  // cache features from last fetch
+
+function populateGrantDropdown(features) {
+  const select = document.getElementById("grantFilter");
+  const prev = select.value;
+  const uniqueGrants = [...new Set(features
+    .map(f => f.properties?.GRANT_NUM)
+    .filter(v => v != null && v !== ""))].sort();
+
+  // rebuild options
+  select.innerHTML = '<option value="">All</option>';
+  uniqueGrants.forEach(grant => {
+    const opt = document.createElement("option");
+    opt.value = grant;
+    opt.textContent = grant;
+    select.appendChild(opt);
+  });
+
+  if (prev && uniqueGrants.includes(prev)) select.value = prev;
+}
+
+function renderLayer() {
+  const selectedGrant = document.getElementById("grantFilter").value;
+
+  const grantFiltered = selectedGrant
+    ? currentFeatures.filter(f => f.properties?.GRANT_NUM === selectedGrant)
+    : currentFeatures;
+
+  // depth-bin filtering (any selected bin)
+  const filtered = grantFiltered.filter(f => {
+    const d = getDepth(f);
+    if (!Number.isFinite(d)) return false;
+    for (const bin of DEPTH_BINS) {
+      if (enabledBins.has(bin.id) && bin.test(d)) return true;
+    }
+    return enabledBins.size === 0 ? false : false;
+  });
+
+  updateStats(filtered);
+
+  layerGroup.clearLayers();
+  const lyr = L.geoJSON({ type: "FeatureCollection", features: filtered }, {
+    pointToLayer: (feature, latlng) => {
+      const d = getDepth(feature);
+      return L.circleMarker(latlng, {
+        radius: 4,
+        weight: 1,
+        color: "#333",
+        fillOpacity: 0.85,
+        fillColor: depthColor(d)
+      });
+    },
+    onEachFeature
+  });
+  layerGroup.addLayer(lyr);
+}
+
+/* ========= Load flow ========= */
+let currentLoadToken = 0;
+
+async function load(useBbox=false) {
+  const token = ++currentLoadToken;
+  document.getElementById("src").textContent = wfsUrl({bbox: null});
+  try {
+    const geojson = await fetchAllFeatures({useBbox, map});
+    if (token !== currentLoadToken) return;
+    currentFeatures = geojson.features || [];
+    populateGrantDropdown(currentFeatures);
+    renderLayer();
+  } catch (err) {
+    console.error(err);
+    alert("Failed to load WFS. " + err.message);
+  }
+}
+
+/* ========= Interactions ========= */
+const useBboxEl = document.getElementById("useBbox");
+let debounceTimer = null;
+function debounce(fn, wait=300) { clearTimeout(debounceTimer); debounceTimer = setTimeout(fn, wait); }
+
+map.whenReady(() => load(true));
+map.on("moveend", () => {
+  if (!useBboxEl.checked) return;
+  debounce(() => load(true), 250);
+});
+document.getElementById("reload").addEventListener("click", () => load(useBboxEl.checked));
+document.getElementById("grantFilter").addEventListener("change", renderLayer);
+</script>
+</body>
+</html>

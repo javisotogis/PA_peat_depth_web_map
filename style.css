@@ -1,0 +1,33 @@
+html, body { height: 100%; margin: 0; }
+
+/* App: map + panel side-by-side, no overlap */
+#app {
+  display: flex;
+  height: 100%;
+  box-sizing: border-box;
+  border: 8px solid #d0d7de;   /* frame around whole app */
+  border-radius: 12px;
+  overflow: hidden;             /* stops the map from spilling out */
+}
+
+/* Map fills remaining space. min-width:0 prevents overflow into panel */
+#map {
+  flex: 1 1 auto;
+  min-width: 0;                 /* ← IMPORTANT in flex layouts */
+}
+
+/* Fixed-width right panel */
+.panel {
+  flex: 0 0 360px;              /* exact panel width */
+  padding: 14px 16px;
+  background: #fff;
+  overflow: auto;
+  box-shadow: -4px 0 12px rgba(0,0,0,0.08);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+}
+
+/* Optional: on small screens, stack vertically */
+@media (max-width: 900px) {
+  #app { flex-direction: column; }
+  .panel { flex: 0 0 auto; box-shadow: none; border-top: 1px solid #eee; }
+}
